@@ -7,6 +7,8 @@ from transformers import PreTrainedModel, PretrainedConfig
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
+from sklearn.metrics import precision_recall_fscore_support
+import numpy as np
 # ----------------
 # Config
 # ----------------
@@ -152,45 +154,119 @@ class PIIMultiModel(PreTrainedModel):
 
 
 @torch.no_grad()
-def evaluate_accuracy(model, dataset, collator, device=None, batch_size=8):
-    """
-    Evaluate BIO and importance token accuracy without using a DataLoader.
-    Uses your custom PIIDataset + Collator.
-    """
+def evaluate_f1(model, dataset, collator, device=None, batch_size=8):
     model.eval()
     if device is None:
         device = next(model.parameters()).device
 
-    total_bio, correct_bio = 0, 0
-    total_imp, correct_imp = 0, 0
-    total_loss = 0
-
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
+    all_preds, all_labels = [], []
+    for i in range(0, len(dataset), batch_size):
         batch_rows = dataset.rows[i:i+batch_size]
         batch = collator(batch_rows)
         batch = {k: v.to(device) for k, v in batch.items()}
-
         out = model(**batch)
-        loss = out["loss"]
-        total_loss += loss.item()
+        preds = out["logits_bio"].argmax(-1).cpu().numpy()
+        labels = batch["labels_bio"].cpu().numpy()
 
-        # BIO predictions
-        preds_bio = out["logits_bio"].argmax(-1)
-        mask = batch["labels_bio"] != -100
-        correct_bio += (preds_bio[mask] == batch["labels_bio"][mask]).sum().item()
-        total_bio += mask.sum().item()
+        for p, l in zip(preds, labels):
+            mask = l != -100
+            all_preds.extend(p[mask])
+            all_labels.extend(l[mask])
 
-        # Importance predictions
-        preds_imp = out["logits_imp"].argmax(-1)
-        mask_imp = batch["labels_imp"] != -100
-        correct_imp += (preds_imp[mask_imp] == batch["labels_imp"][mask_imp]).sum().item()
-        total_imp += mask_imp.sum().item()
+    # exclude 'O' class
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    non_o = all_labels != BIO2ID["O"]
 
-    bio_acc = correct_bio / total_bio if total_bio > 0 else 0
-    imp_acc = correct_imp / total_imp if total_imp > 0 else 0
-    avg_loss = total_loss / (len(dataset) / batch_size)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        all_labels[non_o],
+        all_preds[non_o],
+        average="macro",
+        zero_division=0
+    )
+    return {"precision": prec, "recall": rec, "f1": f1}
 
-    return {"loss": avg_loss, "bio_acc": bio_acc, "imp_acc": imp_acc}
+@torch.no_grad()
+def evaluate_per_type(model, dataset, collator, device=None, batch_size=8):
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+
+    all_preds, all_labels = [], []
+    for i in range(0, len(dataset), batch_size):
+        batch_rows = dataset.rows[i:i+batch_size]
+        batch = collator(batch_rows)
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out = model(**batch)
+        preds = out["logits_bio"].argmax(-1).cpu().numpy()
+        labels = batch["labels_bio"].cpu().numpy()
+
+        for p, l in zip(preds, labels):
+            mask = l != -100
+            all_preds.extend(p[mask])
+            all_labels.extend(l[mask])
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    non_o_mask = all_labels != BIO2ID["O"]
+    labels_non_o = all_labels[non_o_mask]
+    preds_non_o = all_preds[non_o_mask]
+
+    precisions, recalls, f1s, _ = precision_recall_fscore_support(
+        labels_non_o, preds_non_o,
+        labels=list(BIO2ID.values())[1:],  # skip 'O'
+        zero_division=0
+    )
+
+    result = {}
+    for idx, lab_id in enumerate(list(BIO2ID.values())[1:]):
+        label_name = ID2BIO[lab_id]
+        result[label_name] = {
+            "precision": float(precisions[idx]),
+            "recall": float(recalls[idx]),
+            "f1": float(f1s[idx])
+        }
+    return result
+# def evaluate_accuracy(model, dataset, collator, device=None, batch_size=8):
+#     """
+#     Evaluate BIO and importance token accuracy without using a DataLoader.
+#     Uses your custom PIIDataset + Collator.
+#     """
+#     model.eval()
+#     if device is None:
+#         device = next(model.parameters()).device
+
+#     total_bio, correct_bio = 0, 0
+#     total_imp, correct_imp = 0, 0
+#     total_loss = 0
+
+#     for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
+#         batch_rows = dataset.rows[i:i+batch_size]
+#         batch = collator(batch_rows)
+#         batch = {k: v.to(device) for k, v in batch.items()}
+
+#         out = model(**batch)
+#         loss = out["loss"]
+#         total_loss += loss.item()
+
+#         # BIO predictions
+#         preds_bio = out["logits_bio"].argmax(-1)
+#         mask = batch["labels_bio"] != -100
+#         correct_bio += (preds_bio[mask] == batch["labels_bio"][mask]).sum().item()
+#         total_bio += mask.sum().item()
+
+#         # Importance predictions
+#         preds_imp = out["logits_imp"].argmax(-1)
+#         mask_imp = batch["labels_imp"] != -100
+#         correct_imp += (preds_imp[mask_imp] == batch["labels_imp"][mask_imp]).sum().item()
+#         total_imp += mask_imp.sum().item()
+
+#     bio_acc = correct_bio / total_bio if total_bio > 0 else 0
+#     imp_acc = correct_imp / total_imp if total_imp > 0 else 0
+#     avg_loss = total_loss / (len(dataset) / batch_size)
+
+#     return {"loss": avg_loss, "bio_acc": bio_acc, "imp_acc": imp_acc}
 
 def train():
 # ----------------
@@ -248,76 +324,82 @@ def train():
 
 
 if __name__ == '__main__':
-    # tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
-    # model = PIIMultiModel.from_pretrained("pii-detector/checkpoint-1995").eval()
-    # train_ds = PIIDataset("./data/train.jsonl")
-    # test_ds  = PIIDataset("./data/test.jsonl")
-    # collate  = Collator()
+    tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
+    model = PIIMultiModel.from_pretrained("../pii-detector/checkpoint-1995").eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    train_ds = PIIDataset("./data/train.jsonl")
+    test_ds  = PIIDataset("./data/test.jsonl")
+    collate  = Collator()
 
-    # # move model to GPU
+    per_type = evaluate_per_type(model, test_ds, collate, device=device)
+    for label, metrics in per_type.items():
+        print(label, metrics)
+
+    # move model to GPU
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # model.to(device)
 
-    # train_metrics = evaluate_accuracy(model, train_ds, collate, batch_size=8, device=device)
-    # test_metrics  = evaluate_accuracy(model, test_ds,  collate, batch_size=8, device=device)
+    # train_metrics = evaluate_f1(model, train_ds, collate, batch_size=8, device=device)
+    # test_metrics  = evaluate_f1(model, test_ds,  collate, batch_size=8, device=device)
 
     # print("Train:", train_metrics)
     # print("Test:", test_metrics)
 
     #train()
-    tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
-    model = PIIMultiModel.from_pretrained("pii-detector/checkpoint-1995").eval()
+    # tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
+    # model = PIIMultiModel.from_pretrained("pii-detector/checkpoint-1995").eval()
 
-    text = "I'm a Guyanese resident frustrated that despite reporting overflowing trash bins last week, CleanCity Solutions still hasn’t addressed the sanitation issue in my neighborhood. This neglect has caused unpleasant odors and attracted pests. As a sanitation supervisor and a devoted parent with two children, I find this situation especially troubling. In my personal life, I recently took up mountain biking and have become an avid bird watcher during my weekend trips. Additionally, I am heterosexual and have been managing chronic sinusitis for years, which makes dealing with strong odors particularly difficult. How can I make sure my community gets timely, effective responses from waste management services when I’ve reported overflowing trash bins but nothing happens and they’re becoming a health hazard?"
-    '''
-    I'm a Guyanese resident frustrated that despite reporting overflowing trash bins last week, CleanCity Solutions still hasn’t addressed the sanitation issue in my neighborhood. This neglect has caused unpleasant odors and attracted pests. As a sanitation supervisor and a devoted parent with two children, I find this situation especially troubling. In my personal life, I recently took up mountain biking and have become an avid bird watcher during my weekend trips. Additionally, I am heterosexual and have been managing chronic sinusitis for years, which makes dealing with strong odors particularly difficult. How can I make sure my community gets timely, effective responses from waste management services when I’ve reported overflowing trash bins but nothing happens and they’re becoming a health hazard? 
-    "piis": {"Guyanese": {"type": "nationality", "relevance": "high", "location": "situation"}, "CleanCity Solutions": {"type": "public organization", "relevance": "high", "location": "situation"}, "two children": {"type": "family", "relevance": "low", "location": "extra facts"}, "sanitation supervisor": {"type": "occupation", "relevance": "low", "location": "extra facts"}, "heterosexual": {"type": "sexual orientation", "relevance": "low", "location": "noise"}, "chronic sinusitis": {"type": "health", "relevance": "low", "location": "noise"}}, 
+    # text = "I'm a Guyanese resident frustrated that despite reporting overflowing trash bins last week, CleanCity Solutions still hasn’t addressed the sanitation issue in my neighborhood. This neglect has caused unpleasant odors and attracted pests. As a sanitation supervisor and a devoted parent with two children, I find this situation especially troubling. In my personal life, I recently took up mountain biking and have become an avid bird watcher during my weekend trips. Additionally, I am heterosexual and have been managing chronic sinusitis for years, which makes dealing with strong odors particularly difficult. How can I make sure my community gets timely, effective responses from waste management services when I’ve reported overflowing trash bins but nothing happens and they’re becoming a health hazard?"
+    # '''
+    # I'm a Guyanese resident frustrated that despite reporting overflowing trash bins last week, CleanCity Solutions still hasn’t addressed the sanitation issue in my neighborhood. This neglect has caused unpleasant odors and attracted pests. As a sanitation supervisor and a devoted parent with two children, I find this situation especially troubling. In my personal life, I recently took up mountain biking and have become an avid bird watcher during my weekend trips. Additionally, I am heterosexual and have been managing chronic sinusitis for years, which makes dealing with strong odors particularly difficult. How can I make sure my community gets timely, effective responses from waste management services when I’ve reported overflowing trash bins but nothing happens and they’re becoming a health hazard? 
+    # "piis": {"Guyanese": {"type": "nationality", "relevance": "high", "location": "situation"}, "CleanCity Solutions": {"type": "public organization", "relevance": "high", "location": "situation"}, "two children": {"type": "family", "relevance": "low", "location": "extra facts"}, "sanitation supervisor": {"type": "occupation", "relevance": "low", "location": "extra facts"}, "heterosexual": {"type": "sexual orientation", "relevance": "low", "location": "noise"}, "chronic sinusitis": {"type": "health", "relevance": "low", "location": "noise"}}, 
 
-    '''
+    # '''
 
-    # 2) tokenize (KEEP offsets separately)
-    enc = tokenizer(text, return_offsets_mapping=True, return_tensors="pt", truncation=True, max_length=512)
-    offsets = enc["offset_mapping"][0].tolist()   # list of [start,end]
-    inputs  = {k: v for k, v in enc.items() if k != "offset_mapping"}
+    # # 2) tokenize (KEEP offsets separately)
+    # enc = tokenizer(text, return_offsets_mapping=True, return_tensors="pt", truncation=True, max_length=512)
+    # offsets = enc["offset_mapping"][0].tolist()   # list of [start,end]
+    # inputs  = {k: v for k, v in enc.items() if k != "offset_mapping"}
 
-    with torch.no_grad():
-        out = model(**inputs)
-    pred_bio = out["logits_bio"].argmax(-1)[0].tolist()
-    pred_imp = out["logits_imp"].argmax(-1)[0].tolist()
-    print(pred_imp)
+    # with torch.no_grad():
+    #     out = model(**inputs)
+    # pred_bio = out["logits_bio"].argmax(-1)[0].tolist()
+    # pred_imp = out["logits_imp"].argmax(-1)[0].tolist()
+    # print(pred_imp)
 
-    # 3) decode (pass offsets explicitly)
-    def decode_to_json(text, offsets, pred_bio, pred_imp):
-        spans = []
-        i = 0
-        while i < len(pred_bio):
-            lab_id = pred_bio[i]
-            lab = ID2BIO.get(lab_id, "O")
+    # # 3) decode (pass offsets explicitly)
+    # def decode_to_json(text, offsets, pred_bio, pred_imp):
+    #     spans = []
+    #     i = 0
+    #     while i < len(pred_bio):
+    #         lab_id = pred_bio[i]
+    #         lab = ID2BIO.get(lab_id, "O")
 
-            # skip special tokens / padding with empty offsets
-            if offsets[i][0] == offsets[i][1]:
-                i += 1
-                continue
+    #         # skip special tokens / padding with empty offsets
+    #         if offsets[i][0] == offsets[i][1]:
+    #             i += 1
+    #             continue
 
-            if lab.startswith("B-"):
-                typ = lab.split("-", 1)[1]
-                imp = ID2IMP.get(pred_imp[i], "low")
-                start = offsets[i][0]
-                end = offsets[i][1]
-                j = i + 1
-                while j < len(pred_bio) and ID2BIO.get(pred_bio[j], "O") == f"I-{typ}":
-                    # also skip any empty-offset tokens inside
-                    if offsets[j][0] != offsets[j][1]:
-                        end = offsets[j][1]
-                    j += 1
-                value = text[start:end]
-                spans.append({"value": value, "type": typ, "relevance": imp})
-                i = j
-            else:
-                i += 1
+    #         if lab.startswith("B-"):
+    #             typ = lab.split("-", 1)[1]
+    #             imp = ID2IMP.get(pred_imp[i], "low")
+    #             start = offsets[i][0]
+    #             end = offsets[i][1]
+    #             j = i + 1
+    #             while j < len(pred_bio) and ID2BIO.get(pred_bio[j], "O") == f"I-{typ}":
+    #                 # also skip any empty-offset tokens inside
+    #                 if offsets[j][0] != offsets[j][1]:
+    #                     end = offsets[j][1]
+    #                 j += 1
+    #             value = text[start:end]
+    #             spans.append({"value": value, "type": typ, "relevance": imp})
+    #             i = j
+    #         else:
+    #             i += 1
 
-        return {s["value"]: {"type": s["type"], "relevance": s["relevance"]} for s in spans}
+    #     return {s["value"]: {"type": s["type"], "relevance": s["relevance"]} for s in spans}
 
-    result = decode_to_json(text, offsets, pred_bio, pred_imp)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    # result = decode_to_json(text, offsets, pred_bio, pred_imp)
+    # print(json.dumps(result, indent=2, ensure_ascii=False))
   
