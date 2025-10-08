@@ -153,38 +153,157 @@ class PIIMultiModel(PreTrainedModel):
 
 
 
+# @torch.no_grad()
+# def evaluate_f1(model, dataset, collator, device=None, batch_size=8):
+#     model.eval()
+#     if device is None:
+#         device = next(model.parameters()).device
+
+#     all_preds, all_labels = [], []
+#     for i in range(0, len(dataset), batch_size):
+#         batch_rows = dataset.rows[i:i+batch_size]
+#         batch = collator(batch_rows)
+#         batch = {k: v.to(device) for k, v in batch.items()}
+#         out = model(**batch)
+#         preds = out["logits_bio"].argmax(-1).cpu().numpy()
+#         labels = batch["labels_bio"].cpu().numpy()
+
+#         for p, l in zip(preds, labels):
+#             mask = l != -100
+#             all_preds.extend(p[mask])
+#             all_labels.extend(l[mask])
+
+#     # exclude 'O' class
+#     all_preds = np.array(all_preds)
+#     all_labels = np.array(all_labels)
+#     non_o = all_labels != BIO2ID["O"]
+
+#     prec, rec, f1, _ = precision_recall_fscore_support(
+#         all_labels[non_o],
+#         all_preds[non_o],
+#         average="macro",
+#         zero_division=0
+#     )
+#     return {"precision": prec, "recall": rec, "f1": f1}
+
 @torch.no_grad()
-def evaluate_f1(model, dataset, collator, device=None, batch_size=8):
+def evaluate_f1(model, dataset, collator, tokenizer, device=None, batch_size=8):
+    """
+    Evaluate span, type, and importance metrics for token-level RoBERTa model.
+    Returns precision/recall/F1 for each of the three levels.
+    """
+
     model.eval()
     if device is None:
         device = next(model.parameters()).device
 
-    all_preds, all_labels = [], []
-    for i in range(0, len(dataset), batch_size):
-        batch_rows = dataset.rows[i:i+batch_size]
-        batch = collator(batch_rows)
+    def decode_bio(seq):
+        """Convert BIO tag sequence into spans [(start, end, type)]."""
+        spans = []
+        start, cur_type = None, None
+        for i, tag_id in enumerate(seq):
+            tag = ID2BIO[tag_id]
+            if tag == "O":
+                if cur_type is not None:
+                    spans.append((start, i, cur_type))
+                    start, cur_type = None, None
+                continue
+            prefix, t = tag.split("-", 1)
+            if prefix == "B":
+                if cur_type is not None:
+                    spans.append((start, i, cur_type))
+                start, cur_type = i, t
+            elif prefix == "I":
+                if cur_type != t:
+                    if cur_type is not None:
+                        spans.append((start, i, cur_type))
+                    start, cur_type = i, t
+        if cur_type is not None:
+            spans.append((start, len(seq), cur_type))
+        return spans
+
+    gold_spans_all, pred_spans_all = [], []
+    gold_types, pred_types = [], []
+    gold_imps, pred_imps = [], []
+
+    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating spans/types/importance"):
+        rows = dataset.rows[i:i + batch_size]
+        batch = collator(rows)
         batch = {k: v.to(device) for k, v in batch.items()}
         out = model(**batch)
-        preds = out["logits_bio"].argmax(-1).cpu().numpy()
-        labels = batch["labels_bio"].cpu().numpy()
 
-        for p, l in zip(preds, labels):
-            mask = l != -100
-            all_preds.extend(p[mask])
-            all_labels.extend(l[mask])
+        preds_bio = out["logits_bio"].argmax(-1).cpu().numpy()
+        labels_bio = batch["labels_bio"].cpu().numpy()
+        preds_imp = out["logits_imp"].argmax(-1).cpu().numpy()
+        labels_imp = batch["labels_imp"].cpu().numpy()
 
-    # exclude 'O' class
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    non_o = all_labels != BIO2ID["O"]
+        for lb, pb, li, pi in zip(labels_bio, preds_bio, labels_imp, preds_imp):
+            mask = lb != -100
+            lb, pb, li, pi = lb[mask], pb[mask], li[mask], pi[mask]
 
-    prec, rec, f1, _ = precision_recall_fscore_support(
-        all_labels[non_o],
-        all_preds[non_o],
-        average="macro",
-        zero_division=0
+            gold_spans = decode_bio(lb)
+            pred_spans = decode_bio(pb)
+
+            gold_spans_all.append(gold_spans)
+            pred_spans_all.append(pred_spans)
+
+            # For type and importance, check overlap and correctness
+            gold_set = {(s, e, t) for s, e, t in gold_spans}
+            pred_set = {(s, e, t) for s, e, t in pred_spans}
+
+            # collect types for matching spans
+            for g in gold_set:
+                gold_types.append(g[2])
+                # Did we predict a span with same boundaries?
+                matched = [p for p in pred_set if p[0] == g[0] and p[1] == g[1]]
+                if matched:
+                    pred_types.append(matched[0][2])
+                else:
+                    pred_types.append("NONE")
+
+            # importance for exact span+type matches only
+            for (s, e, t) in gold_set:
+                matched = [(ss, ee, tt) for (ss, ee, tt) in pred_set if s == ss and e == ee and t == tt]
+                if matched:
+                    gold_imps.append(ID2IMP.get(li[s], "low"))
+                    pred_imps.append(ID2IMP.get(pi[s], "low"))
+
+    # ===== Span Detection =====
+    gold_flat = [span for spans in gold_spans_all for span in spans]
+    pred_flat = [span for spans in pred_spans_all for span in spans]
+    gold_bounds = {(s, e) for (s, e, _) in gold_flat}
+    pred_bounds = {(s, e) for (s, e, _) in pred_flat}
+
+    tp = len(gold_bounds & pred_bounds)
+    fp = len(pred_bounds - gold_bounds)
+    fn = len(gold_bounds - pred_bounds)
+    span_prec = tp / (tp + fp + 1e-10)
+    span_rec = tp / (tp + fn + 1e-10)
+    span_f1 = 2 * span_prec * span_rec / (span_prec + span_rec + 1e-10)
+
+    # ===== Type Classification =====
+    labels_type = sorted(set(gold_types + pred_types))
+    prec_t, rec_t, f1_t, _ = precision_recall_fscore_support(
+        gold_types, pred_types, labels=labels_type, average="macro", zero_division=0
     )
-    return {"precision": prec, "recall": rec, "f1": f1}
+
+    # ===== Importance Classification =====
+    labels_imp = ["low", "high"]
+    prec_i, rec_i, f1_i, _ = precision_recall_fscore_support(
+        gold_imps, pred_imps, labels=labels_imp, average="macro", zero_division=0
+    )
+
+    return {
+        "span_precision": span_prec,
+        "span_recall": span_rec,
+        "span_f1": span_f1,
+        "type_precision": prec_t,
+        "type_recall": rec_t,
+        "type_f1": f1_t,
+        "importance_precision": prec_i,
+        "importance_recall": rec_i,
+        "importance_f1": f1_i
+    }
 
 @torch.no_grad()
 def evaluate_per_type(model, dataset, collator, device=None, batch_size=8):
@@ -325,28 +444,28 @@ def train():
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
-    model = PIIMultiModel.from_pretrained("../pii-detector/checkpoint-1995").eval()
+    model = PIIMultiModel.from_pretrained("pii-detector/checkpoint-1995").eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     train_ds = PIIDataset("./data/train.jsonl")
     test_ds  = PIIDataset("./data/test.jsonl")
     collate  = Collator()
 
-    per_type = evaluate_per_type(model, test_ds, collate, device=device)
-    for label, metrics in per_type.items():
-        print(label, metrics)
+    # per_type = evaluate_per_type(model, test_ds, collate, device=device)
+    # for label, metrics in per_type.items():
+    #     print(label, metrics)
 
-    # move model to GPU
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # model.to(device)
+    #move model to GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-    # train_metrics = evaluate_f1(model, train_ds, collate, batch_size=8, device=device)
-    # test_metrics  = evaluate_f1(model, test_ds,  collate, batch_size=8, device=device)
+    #train_metrics = evaluate_f1(model, train_ds, collate, batch_size=8, device=device)
+    test_metrics  = evaluate_f1(model, test_ds,  collate, tokenizer, batch_size=8, device=device)
 
-    # print("Train:", train_metrics)
-    # print("Test:", test_metrics)
+    #print("Train:", train_metrics)
+    print("Test:", test_metrics)
 
-    #train()
+   #train()
     # tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True, add_prefix_space=True)
     # model = PIIMultiModel.from_pretrained("pii-detector/checkpoint-1995").eval()
 

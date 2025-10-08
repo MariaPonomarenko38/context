@@ -18,12 +18,12 @@ from trl import SFTTrainer, SFTConfig
 #                 BASIC CONFIGURATION
 # ==========================================================
 MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
-DATA_PATH = "./data/formatted.jsonl"
+DATA_PATH = "./data/formatted_pii_detection.jsonl"
 OUTPUT_DIR = "./mistral7b-lora-pii"
-BATCH_SIZE = 2
-GRAD_ACCUM_STEPS = 8
+BATCH_SIZE = 25
+GRAD_ACCUM_STEPS = 2
 LR = 2e-5
-EPOCHS = 2
+EPOCHS = 1
 
 os.environ["WANDB_PROJECT"] = "context-aware-pii-detection"
 os.environ["WANDB_MODE"] = "online" 
@@ -66,16 +66,24 @@ model = AutoModelForCausalLM.from_pretrained(
 # ==========================================================
 model = prepare_model_for_kbit_training(model)
 
+
 lora_config = LoraConfig(
     r=64,                      # rank of LoRA adapters
-    lora_alpha=16,             # scaling factor
-    target_modules=["q_proj", "v_proj"],  # efficient choice for Mistral
+    lora_alpha=128,             # scaling factor
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj", "lm_head"
+        
+    ],  # efficient choice for Mistral
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
 )
 
 model = get_peft_model(model, lora_config)
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(name)
 
 # ==========================================================
 #                 TRAINING CONFIGURATION
@@ -91,6 +99,7 @@ sft_config = SFTConfig(
     logging_steps=10,
     save_strategy="epoch",
     dataset_text_field="text",
+    optim="paged_adamw_32bit",
     bf16=True,
     packing=False,
 )
