@@ -2,13 +2,12 @@
 Example usage:
 
 # With validation loss + early stopping on eval_loss
-python -m fine_tuning.SFT_val --model_name_or_path Qwen/Qwen2.5-7B \
-    --max_length 512 --batch_size 16 --num_epochs 20 \
+python -m train_alireza --model_name_or_path Qwen/Qwen2.5-7B \
+    --max_length 512 --batch_size 32 --num_epochs 1 \
     --use_lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
     --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj --lr 5e-5 \
-    --train_file context/data/train.tsv \
-    --val_file context/data/val.tsv \
-    --test_file data/test.tsv \
+    --train_file ./data/train.tsv \
+    --val_file ./data/val.tsv \
     --skip_header \
     --task_name context-aware-pii-detection \
     --early_stop_patience 2 \
@@ -697,7 +696,7 @@ def main():
     )
     trainer.train()
 
-    SAVE_DIR = "/scratch/m2ponoma/outputs/context-pii-detection-qwen"
+    SAVE_DIR = "models/context-pii-detection-qwen"
     trainer.model.save_pretrained(SAVE_DIR)
     tokenizer.save_pretrained(SAVE_DIR)
     print(f"✅ LoRA fine-tuned model saved to {SAVE_DIR}")
@@ -707,10 +706,10 @@ def main():
     # ==========================================================
     # Make sure you've logged in first:
     # >>> huggingface-cli login
-    repo_name = "ponoma16/Qwen-2b-finetuned"  # change this
+    # repo_name = "ponoma16/Qwen-2b-finetuned"  # change this
 
-    trainer.push_to_hub(repo_name, commit_message="Initial LoRA fine-tuned model")
-    print(f"🚀 Model pushed to Hugging Face Hub: https://huggingface.co/{repo_name}")
+    # trainer.push_to_hub(repo_name, commit_message="Initial LoRA fine-tuned model")
+    # print(f"🚀 Model pushed to Hugging Face Hub: https://huggingface.co/{repo_name}")
     # Final evaluation
     # if args.num_epochs == 0:
     # metrics = evaluate_accuracy(
