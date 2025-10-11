@@ -57,7 +57,8 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 {}
 
 ### Input:
-{}
+Text: {}
+Question: {}
 
 ### Response:
 {}"""
@@ -65,15 +66,21 @@ alpaca_prompt = """Below is an instruction that describes a task, paired with an
 EOS_TOKEN = tokenizer.eos_token # Must add EOS_TOKEN
 def formatting_prompts_func(examples):
     instructions = [
-        "Find all PIIs (Personally Identifiable Information) in the text and output them separated by commas."
+        """You are given the text and the question.
+        Find all PIIs (Personally Identifiable Information) in the text and output them separated by commas.
+        Classify them into one of the following types: nationality, age, occupation, education, location, public organization, health, sexual orientation, finance, family.
+        Classify their relevance to the question: high, low.
+        Output result in the JSON format.
+        """
     ] * len(examples["context"])
 
-    inputs = examples["context"]
+    inputs_contexts = examples["context"]
+    inputs_questions = examples["question"]
     outputs = examples["piis"]
     texts = []
-    for instruction, input, output in zip(instructions, inputs, outputs):
+    for instruction, input_c, input_q, output in zip(instructions, inputs_contexts,inputs_questions, outputs):
         # Must add EOS_TOKEN, otherwise your generation will go on forever!
-        text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
+        text = alpaca_prompt.format(instruction, input_c, input_q, output) + EOS_TOKEN
         texts.append(text)
     return { "text" : texts, }
 
@@ -82,9 +89,17 @@ with open("./data/train.jsonl", "r", encoding="utf-8") as f:
     data = [json.loads(line) for line in f]
 # Replace nested "piis" with comma-separated keys
 for sample in data:
+    piis = sample.get("piis", {})
+    if isinstance(piis, dict):
+        for pii_name, pii_info in list(piis.items()):
+            if isinstance(pii_info, dict) and "location" in pii_info:
+                del pii_info["location"]   # 🔥 remove only that field
+        sample["piis"] = piis
+
+# --- Optionally replace 'piis' with comma-separated keys ---
+for sample in data:
     if isinstance(sample.get("piis"), dict):
-        # join all PII entity names into one string
-        sample["piis"] = ", ".join(sample["piis"].keys())
+        sample["piis"] = json.dumps(sample["piis"])
     else:
         sample["piis"] = ""
 
@@ -102,19 +117,22 @@ trainer = SFTTrainer(
     args = SFTConfig(
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
-        # Use num_train_epochs = 1, warmup_ratio for full training runs!
-        warmup_steps = 5,
-        max_steps = 60,
+
+        # Use epochs instead of steps:
+        num_train_epochs = 3,        # 👈 how many full passes over the dataset
+        warmup_ratio = 0.03,         # 👈 fraction of total steps used for LR warmup (e.g., 3%)
+
         learning_rate = 2e-4,
-        logging_steps = 1,
+        logging_steps = 10,
+
         optim = "adamw_8bit",
         weight_decay = 0.01,
         lr_scheduler_type = "linear",
+
         seed = 3407,
         output_dir = "outputs",
-        report_to = "none", # Use this for WandB etc
-    ),
-) 
+        report_to = "none",          # use "wandb" if you want to log to Weights & Biases
+    ))
 
 trainer.train()
 
